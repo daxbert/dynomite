@@ -107,7 +107,7 @@ event_add_in(struct event_base *evb, struct conn *c)
         return 0;
     }
 
-    event.events = (uint32_t)(EPOLLIN | EPOLLET);
+    event.events = (uint32_t)(EPOLLIN); // | EPOLLET);
     event.data.ptr = c;
 
     status = epoll_ctl(ep, EPOLL_CTL_MOD, c->sd, &event);
@@ -143,9 +143,10 @@ event_add_out(struct event_base *evb, struct conn *c)
         return 0;
     }
 
-    event.events = (uint32_t)(EPOLLIN | EPOLLOUT | EPOLLET);
+    event.events = (uint32_t)(EPOLLIN | EPOLLOUT); // | EPOLLET);
     event.data.ptr = c;
 
+    log_debug(LOG_DEBUG, "adding conn %p(%s) to active", c, conn_get_type_string(c));
     status = epoll_ctl(ep, EPOLL_CTL_MOD, c->sd, &event);
     if (status < 0) {
         log_error("epoll ctl on e %d sd %d failed: %s", ep, c->sd,
@@ -176,6 +177,7 @@ event_del_out(struct event_base *evb, struct conn *c)
     event.events = (uint32_t)(EPOLLIN | EPOLLET);
     event.data.ptr = c;
 
+    log_debug(LOG_DEBUG, "removing conn %p(%s) from active", c, conn_get_type_string(c));
     status = epoll_ctl(ep, EPOLL_CTL_MOD, c->sd, &event);
     if (status < 0) {
         log_error("epoll ctl on e %d sd %d failed: %s", ep, c->sd,
@@ -201,6 +203,7 @@ event_add_conn(struct event_base *evb, struct conn *c)
     event.events = (uint32_t)(EPOLLIN | EPOLLOUT | EPOLLET);
     event.data.ptr = c;
 
+    log_debug(LOG_DEBUG, "adding conn %p(%s) to active", c, conn_get_type_string(c));
     status = epoll_ctl(ep, EPOLL_CTL_ADD, c->sd, &event);
     if (status < 0) {
         log_error("epoll ctl on e %d sd %d failed: %s", ep, c->sd,
@@ -223,6 +226,7 @@ event_del_conn(struct event_base *evb, struct conn *c)
     ASSERT(c != NULL);
     ASSERT(c->sd > 0);
 
+    log_debug(LOG_DEBUG, "removing conn %p(%s) from active", c, conn_get_type_string(c));
     status = epoll_ctl(ep, EPOLL_CTL_DEL, c->sd, NULL);
     if (status < 0) {
         log_error("epoll ctl on e %d sd %d failed: %s", ep, c->sd,
@@ -246,8 +250,6 @@ event_wait(struct event_base *evb, int timeout)
     ASSERT(event != NULL);
     ASSERT(nevent > 0);
 
-    log_debug(LOG_VVERB, "epoll ep %d", ep);
-
     for (;;) {
         int i, nsd;
 
@@ -257,10 +259,10 @@ event_wait(struct event_base *evb, int timeout)
                 struct epoll_event *ev = &evb->event[i];
                 uint32_t events = 0;
 
-                log_debug(LOG_VVERB, "epoll %04"PRIX32" triggered on conn %p",
+                log_debug(LOG_VVVERB, "epoll %04"PRIX32" triggered on conn %p",
                           ev->events, ev->data.ptr);
 
-                if (ev->events & EPOLLERR) {
+                if (ev->events & (EPOLLERR | EPOLLRDHUP)) {
                     events |= EVENT_ERR;
                 }
 
@@ -338,6 +340,54 @@ event_loop_stats(event_stats_cb_t cb, void *arg)
         }
 
         cb(st, &n);
+    }
+
+error:
+    status = close(ep);
+    if (status < 0) {
+        log_error("close e %d failed, ignored: %s", ep, strerror(errno));
+    }
+    ep = -1;
+}
+
+void
+event_loop_entropy(event_entropy_cb_t cb, void *arg)
+{
+    struct entropy *ent = arg;
+    int status, ep;
+    struct epoll_event ev;
+    ent->interval = 30;
+
+    ep = epoll_create(1);
+    if (ep < 0) {
+        log_error("entropy epoll create failed: %s", strerror(errno));
+        return;
+    }
+
+    ev.data.fd = ent->sd;
+    ev.events = EPOLLIN;
+
+    status = epoll_ctl(ep, EPOLL_CTL_ADD, ent->sd, &ev);
+    if (status < 0) {
+        log_error("entropy epoll ctl on e %d sd %d failed: %s", ep, ent->sd,
+                  strerror(errno));
+        goto error;
+    }
+
+    for (;;) {
+        int n;
+
+        n = epoll_wait(ep, &ev, 1, ent->interval);
+        if (n < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            log_error("entropy epoll wait on e %d with m %d failed: %s", ep,
+            		ent->sd, strerror(errno));
+            break;
+        }
+
+        cb(ent, &n);
     }
 
 error:

@@ -126,6 +126,20 @@ memcache_delete(struct msg *r)
     return false;
 }
 
+/*
+ * Return true if the memcache command is a touch command, otherwise
+ * return false
+ */
+static bool
+memcache_touch(struct msg *r)
+{
+    if (r->type == MSG_REQ_MC_TOUCH) {
+        return true;
+    }
+
+    return false;
+}
+
 void
 memcache_parse_req(struct msg *r)
 {
@@ -162,7 +176,6 @@ memcache_parse_req(struct msg *r)
     b = STAILQ_LAST(&r->mhdr, mbuf, next);
 
     ASSERT(r->request);
-    ASSERT(!r->redis);
     ASSERT(state >= SW_START && state < SW_SENTINEL);
     ASSERT(b != NULL);
     ASSERT(b->pos <= b->last);
@@ -254,6 +267,15 @@ memcache_parse_req(struct msg *r)
 
                     break;
 
+                case 5:
+                    if (str5cmp(m, 't', 'o', 'u', 'c', 'h')) {
+                        r->type = MSG_REQ_MC_TOUCH;
+                        r->is_read = 0;
+                        break;
+                    }
+
+                    break;
+
                 case 6:
                     if (str6cmp(m, 'a', 'p', 'p', 'e', 'n', 'd')) {
                         r->type = MSG_REQ_MC_APPEND;
@@ -297,6 +319,7 @@ memcache_parse_req(struct msg *r)
                 case MSG_REQ_MC_PREPEND:
                 case MSG_REQ_MC_INCR:
                 case MSG_REQ_MC_DECR:
+                case MSG_REQ_MC_TOUCH:
                     if (ch == CR) {
                         goto error;
                     }
@@ -345,7 +368,7 @@ memcache_parse_req(struct msg *r)
                 /* get next state */
                 if (memcache_storage(r)) {
                     state = SW_SPACES_BEFORE_FLAGS;
-                } else if (memcache_arithmetic(r)) {
+                } else if (memcache_arithmetic(r) || memcache_touch(r)) {
                     state = SW_SPACES_BEFORE_NUM;
                 } else if (memcache_delete(r)) {
                     state = SW_RUNTO_CRLF;
@@ -534,7 +557,7 @@ memcache_parse_req(struct msg *r)
 
         case SW_SPACES_BEFORE_NUM:
             if (ch != ' ') {
-                if (!isdigit(ch)) {
+                if (!(isdigit(ch) || ch == '-')) {
                     goto error;
                 }
                 /* num_start <- p; num <- ch - '0'  */
@@ -565,7 +588,7 @@ memcache_parse_req(struct msg *r)
                 break;
 
             case 'n':
-                if (memcache_storage(r) || memcache_arithmetic(r) || memcache_delete(r)) {
+                if (memcache_storage(r) || memcache_arithmetic(r) || memcache_delete(r) || memcache_touch(r)) {
                     /* noreply_start <- p */
                     r->token = p;
                     state = SW_NOREPLY;
@@ -596,10 +619,10 @@ memcache_parse_req(struct msg *r)
             case CR:
                 m = r->token;
                 if (((p - m) == 7) && str7cmp(m, 'n', 'o', 'r', 'e', 'p', 'l', 'y')) {
-                    ASSERT(memcache_storage(r) || memcache_arithmetic(r) || memcache_delete(r));
+                    ASSERT(memcache_storage(r) || memcache_arithmetic(r) || memcache_delete(r) || memcache_touch(r));
                     r->token = NULL;
                     /* noreply_end <- p - 1 */
-                    r->noreply = 1;
+                    r->expect_datastore_reply = 0;
                     state = SW_AFTER_NOREPLY;
                     p = p - 1; /* go back by 1 byte */
                 } else {
@@ -758,7 +781,6 @@ memcache_parse_rsp(struct msg *r)
     b = STAILQ_LAST(&r->mhdr, mbuf, next);
 
     ASSERT(!r->request);
-    ASSERT(!r->redis);
     ASSERT(state >= SW_START && state < SW_SENTINEL);
     ASSERT(b != NULL);
     ASSERT(b->pos <= b->last);
@@ -861,6 +883,11 @@ memcache_parse_rsp(struct msg *r)
                         break;
                     }
 
+                    if (str7cmp(m, 'T', 'O', 'U', 'C', 'H', 'E', 'D')) {
+                        r->type = MSG_RSP_MC_TOUCHED;
+                        break;
+                    }
+
                     break;
 
                 case 9:
@@ -902,6 +929,7 @@ memcache_parse_rsp(struct msg *r)
                 case MSG_RSP_MC_EXISTS:
                 case MSG_RSP_MC_NOT_FOUND:
                 case MSG_RSP_MC_DELETED:
+                case MSG_RSP_MC_TOUCHED:
                     state = SW_CRLF;
                     break;
 
@@ -1197,7 +1225,6 @@ memcache_pre_splitcopy(struct mbuf *mbuf, void *arg)
     struct string gets = string("gets "); /* 'gets ' string */
 
     ASSERT(r->request);
-    ASSERT(!r->redis);
     ASSERT(mbuf_empty(mbuf));
 
     switch (r->type) {
@@ -1225,7 +1252,6 @@ memcache_post_splitcopy(struct msg *r)
     struct string crlf = string(CRLF);
 
     ASSERT(r->request);
-    ASSERT(!r->redis);
     ASSERT(!STAILQ_EMPTY(&r->mhdr));
 
     mbuf = STAILQ_LAST(&r->mhdr, mbuf, next);

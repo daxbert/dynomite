@@ -88,6 +88,7 @@
 int dn_set_blocking(int sd);
 int dn_set_nonblocking(int sd);
 int dn_set_reuseaddr(int sd);
+int dn_set_keepalive(int sd, int val);
 int dn_set_tcpnodelay(int sd);
 int dn_set_linger(int sd, int timeout);
 int dn_set_sndbuf(int sd, int size);
@@ -163,10 +164,33 @@ ssize_t _dn_recvn(int sd, void *vptr, size_t n);
  * DN_ASSERT_PANIC or DN_ASSERT_LOG was defined at the moment
  * ASSERT was called.
  */
+
+// http://www.pixelbeat.org/programming/gcc/static_assert.html
+#define ASSERT_CONCAT_(a, b) a##b
+#define ASSERT_CONCAT(a, b) ASSERT_CONCAT_(a, b)
+#ifdef __COUNTER__
+  #define STATIC_ASSERT(e,m) \
+    ;enum { ASSERT_CONCAT(static_assert_, __COUNTER__) = 1/(!!(e)) }
+#else
+  /* This can't be used twice on the same line so ensure if using in headers
+   * that the headers are not included twice (by wrapping in #ifndef...#endif)
+   * Note it doesn't cause an issue when used on same line of separate modules
+   * compiled with gcc -combine -fwhole-program.  */
+  #define STATIC_ASSERT(e,m) \
+    ;enum { ASSERT_CONCAT(assert_line_, __LINE__) = 1/(!!(e)) }
+#endif
+
 #ifdef DN_ASSERT_PANIC
 
 #define ASSERT(_x) do {                         \
     if (!(_x)) {                                \
+        dn_assert(#_x, __FILE__, __LINE__, 1);  \
+    }                                           \
+} while (0)
+
+#define ASSERT_LOG(_x, _M, ...) do {            \
+    if (!(_x)) {                                \
+        log_error("Assertion Failed: "_M, ##__VA_ARGS__);            \
         dn_assert(#_x, __FILE__, __LINE__, 1);  \
     }                                           \
 } while (0)
@@ -181,11 +205,19 @@ ssize_t _dn_recvn(int sd, void *vptr, size_t n);
     }                                           \
 } while (0)
 
+#define ASSERT_LOG(_x, _M, ...) do {            \
+    if (!(_x)) {                                \
+        log_error("ASSERTION FAILED: "_M, ##__VA_ARGS__);            \
+        dn_assert(#_x, __FILE__, __LINE__, 0);  \
+    }                                           \
+} while (0)
+
 #define NOT_REACHED() ASSERT(0)
 
 #else
 
 #define ASSERT(_x)
+#define ASSERT_LOG(_x, _M, ...)
 
 #define NOT_REACHED()
 
@@ -318,8 +350,8 @@ void dn_stacktrace(int skip_count);
 
 int _scnprintf(char *buf, size_t size, const char *fmt, ...);
 int _vscnprintf(char *buf, size_t size, const char *fmt, va_list args);
-int64_t dn_usec_now(void);
-int64_t dn_msec_now(void);
+usec_t dn_usec_now(void);
+msec_t dn_msec_now(void);
 
 /*
  * Address resolution for internet (ipv4 and ipv6) and unix domain
@@ -340,5 +372,10 @@ int dn_resolve(struct string *name, int port, struct sockinfo *si);
 char *dn_unresolve_addr(struct sockaddr *addr, socklen_t addrlen);
 char *dn_unresolve_peer_desc(int sd);
 char *dn_unresolve_desc(int sd);
+
+unsigned int dict_string_hash(const void *key);
+int dict_string_key_compare(void *privdata, const void *key1, const void *key2);
+void dict_string_destructor(void *privdata, void *val);
+
 
 #endif

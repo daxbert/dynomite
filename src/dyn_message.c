@@ -27,7 +27,9 @@
 
 #include "dyn_core.h"
 #include "dyn_server.h"
+#include "dyn_dnode_peer.h"
 #include "proto/dyn_proto.h"
+#include "hashkit/dyn_hashkit.h"
 
 #if (IOV_MAX > 128)
 #define DN_IOV_MAX 128
@@ -36,13 +38,13 @@
 #endif
 
 /*
- *            dn_message.[ch]
+ *            dyn_message.[ch]
  *         message (struct msg)
  *            +        +            .
  *            |        |            .
  *            /        \            .
- *         Request    Response      .../ dn_mbuf.[ch]  (mesage buffers)
- *      dn_request.c  dn_response.c .../ dn_memcache.c; dn_redis.c (message parser)
+ *         Request    Response      .../ dyn_mbuf.[ch]  (mesage buffers)
+ *      dyn_request.c  dyn_response.c .../ dyn_memcache.c; dyn_redis.c (message parser)
  *
  * Messages in dynomite are manipulated by a chain of processing handlers,
  * where each handler is responsible for taking the input and producing an
@@ -114,12 +116,71 @@
  * server.
  */
 
+/* Changes to message for consistency:
+ * In order to implement consistency, following changes have been made to message
+ * peer: Previously there was a one to one relation between request and a response
+ *      both of which is struct message unfortunately. And due to the fact that
+ *      some requests are forwarded as is to the underlying server while some
+ *      are copied, the notion of 'peer' gets complicated. hence I changed its
+ *      meaning somewhat. response->peer points to request that this response belongs
+ *      to. Right now request->peer does not have any meaning other than some
+ *      code in redis which does coalescing etc, and some other code just for
+ *      the sake of it.
+ * awaiting_rsps: This is a counter of the number of responses that a request is
+ *      still expecting. For DC_ONE consistency this is immaterial. For DC_QUORUM,
+ *      this is the total number of responses expected. We wait for them to arrive
+ *      before we free the request. A client connection in turn waits for all the
+ *      requests to finish before freeing itself. (Look for waiting_to_unref).
+ * selected_rsp : A request->selected_rsp is the response selected for a given
+ *      request. All code related to sending response should look at selected_rsp.
+ * rsp_sent : Due to consistency DC_QUORUM, we would have sent the response for
+ *      a request even before all the responses arrive. The responses coming after
+ *      rsp_sent are extra and can be swallowed. Also at this time we know that
+ *      the response is sent and the request can be deleted from the client hash
+ *      table outstanding_msgs_dict.
+ *
+ * So generally request->selected_rsp & response->peer is valid. Eventually it
+ * will be good to have different structures for request and response.
+ */
 static uint64_t msg_id;          /* message id counter */
 static uint64_t frag_id;         /* fragment id counter */
-static uint32_t nfree_msgq;      /* # free msg q */
+static size_t nfree_msgq;        /* # free msg q */
 static struct msg_tqh free_msgq; /* free msg q */
 static struct rbtree tmo_rbt;    /* timeout rbtree */
 static struct rbnode tmo_rbs;    /* timeout rbtree sentinel */
+static size_t alloc_msgs_max;	 /* maximum number of allowed allocated messages */
+uint8_t g_timeout_factor = 1;
+func_mbuf_copy_t     g_pre_splitcopy;   /* message pre-split copy */
+func_msg_post_splitcopy_t g_post_splitcopy;  /* message post-split copy */
+func_msg_coalesce_t  g_pre_coalesce;    /* message pre-coalesce */
+func_msg_coalesce_t  g_post_coalesce;   /* message post-coalesce */
+
+void
+set_datastore_ops(void)
+{
+    switch(g_data_store) {
+        case DATA_REDIS:
+            g_pre_splitcopy = redis_pre_splitcopy;
+            g_post_splitcopy = redis_post_splitcopy;
+            g_pre_coalesce = redis_pre_coalesce;
+            g_post_coalesce = redis_post_coalesce;
+            break;
+        case DATA_MEMCACHE:
+            g_pre_splitcopy = memcache_pre_splitcopy;
+            g_post_splitcopy = memcache_post_splitcopy;
+            g_pre_coalesce = memcache_pre_coalesce;
+            g_post_coalesce = memcache_post_coalesce;
+            break;
+        default:
+            return;
+    }
+}
+
+static inline rstatus_t
+msg_cant_handle_response(struct msg *req, struct msg *rsp)
+{
+    return DN_ENO_IMPL;
+}
 
 static struct msg *
 msg_from_rbe(struct rbnode *node)
@@ -150,25 +211,28 @@ void
 msg_tmo_insert(struct msg *msg, struct conn *conn)
 {
     struct rbnode *node;
-    int timeout;
+    msec_t timeout;
 
-    ASSERT(msg->request);
-    ASSERT(!msg->quit && !msg->noreply);
+    //ASSERT(msg->request);
+    ASSERT(!msg->quit && msg->expect_datastore_reply);
 
-    //TODOs: need to fix this for different timeouts
-    timeout = server_timeout(conn);
+    timeout = conn->dyn_mode? dnode_peer_timeout(msg, conn) : server_timeout(conn);
     if (timeout <= 0) {
         return;
     }
+    timeout = timeout * g_timeout_factor;
 
     node = &msg->tmo_rbe;
+    node->timeout = timeout;
     node->key = dn_msec_now() + timeout;
     node->data = conn;
 
     rbtree_insert(&tmo_rbt, node);
 
-    log_debug(LOG_VERB, "insert msg %"PRIu64" into tmo rbt with expiry of "
+    if (log_loggable(LOG_VERB)) {
+       log_debug(LOG_VERB, "insert msg %"PRIu64" into tmo rbt with expiry of "
               "%d msec", msg->id, timeout);
+    }
 }
 
 void
@@ -186,22 +250,44 @@ msg_tmo_delete(struct msg *msg)
 
     rbtree_delete(&tmo_rbt, node);
 
-    log_debug(LOG_VERB, "delete msg %"PRIu64" from tmo rbt", msg->id);
+    if (log_loggable(LOG_VERB)) {
+       log_debug(LOG_VERB, "delete msg %"PRIu64" from tmo rbt", msg->id);
+    }
 }
 
+
+static size_t alloc_msg_count = 0;
+
 static struct msg *
-_msg_get(void)
+_msg_get(struct conn *conn, const char *const caller)
 {
     struct msg *msg;
 
     if (!TAILQ_EMPTY(&free_msgq)) {
-        ASSERT(nfree_msgq > 0);
+        ASSERT(nfree_msgq);
 
         msg = TAILQ_FIRST(&free_msgq);
         nfree_msgq--;
         TAILQ_REMOVE(&free_msgq, msg, m_tqe);
         goto done;
     }
+
+    //protect our server in the slow network and high traffics.
+    //we drop client requests but still honor our peer requests
+    if (alloc_msg_count >= alloc_msgs_max) {
+         log_debug(LOG_WARN, "allocated #msgs %lu hit max allowable limit", alloc_msg_count);
+         return NULL;
+    }
+
+    alloc_msg_count++;
+
+
+    if (alloc_msg_count % 1000 == 0)
+        log_warn("alloc_msg_count: %lu caller: %s conn: %s sd: %d",
+                 alloc_msg_count, caller, conn_get_type_string(conn), conn->sd);
+    else
+        log_info("alloc_msg_count: %lu caller: %s conn: %s sd: %d",
+                 alloc_msg_count, caller, conn_get_type_string(conn), conn->sd);
 
     msg = dn_alloc(sizeof(*msg));
     if (msg == NULL) {
@@ -211,8 +297,14 @@ _msg_get(void)
 done:
     /* c_tqe, s_tqe, and m_tqe are left uninitialized */
     msg->id = ++msg_id;
+    msg->parent_id = 0;
     msg->peer = NULL;
     msg->owner = NULL;
+    msg->stime_in_microsec = 0ULL;
+    msg->request_send_time = 0L;
+    msg->request_inqueue_enqueue_time_us = 0L;
+    msg->awaiting_rsps = 0;
+    msg->selected_rsp = NULL;
 
     rbtree_node_init(&msg->tmo_rbe);
 
@@ -225,11 +317,6 @@ done:
 
     msg->parser = NULL;
     msg->result = MSG_PARSE_OK;
-
-    msg->pre_splitcopy = NULL;
-    msg->post_splitcopy = NULL;
-    msg->pre_coalesce = NULL;
-    msg->post_coalesce = NULL;
 
     msg->type = MSG_UNKNOWN;
 
@@ -255,37 +342,50 @@ done:
     msg->ferror = 0;
     msg->request = 0;
     msg->quit = 0;
-    msg->noreply = 0;
+    msg->expect_datastore_reply = 1;
     msg->done = 0;
     msg->fdone = 0;
     msg->first_fragment = 0;
     msg->last_fragment = 0;
     msg->swallow = 0;
-    msg->redis = 0;
+    msg->dnode_header_prepended = 0;
+    msg->rsp_sent = 0;
 
     //dynomite
+    msg->is_read = 1;
     msg->dyn_state = 0;
     msg->dmsg = NULL;
-    msg->msg_type = 0;
-
+    msg->msg_routing = ROUTING_NORMAL;
+    msg->dyn_error = 0;
+    msg->rsp_handler = msg_cant_handle_response;
+    msg->consistency = DC_ONE;
     return msg;
 }
 
+size_t msg_alloc_msgs()
+{
+    return alloc_msg_count;
+}
+
+size_t msg_free_queue_size(void)
+{
+    return nfree_msgq;
+}
+
 struct msg *
-msg_get(struct conn *conn, bool request, bool redis)
+msg_get(struct conn *conn, bool request, const char * const caller)
 {
     struct msg *msg;
 
-    msg = _msg_get();
+    msg = _msg_get(conn, caller);
     if (msg == NULL) {
         return NULL;
     }
 
     msg->owner = conn;
     msg->request = request ? 1 : 0;
-    msg->redis = redis ? 1 : 0;
 
-    if (redis) {
+    if (g_data_store == DATA_REDIS) {
         if (request) {
             if (conn->dyn_mode) {
                msg->parser = dyn_parse_req;
@@ -299,11 +399,7 @@ msg_get(struct conn *conn, bool request, bool redis)
                msg->parser = redis_parse_rsp;
             }
         }
-        msg->pre_splitcopy = redis_pre_splitcopy;
-        msg->post_splitcopy = redis_post_splitcopy;
-        msg->pre_coalesce = redis_pre_coalesce;
-        msg->post_coalesce = redis_post_coalesce;
-    } else {
+    } else if (g_data_store == DATA_MEMCACHE) {
         if (request) {
             if (conn->dyn_mode) {
                msg->parser = dyn_parse_req;
@@ -317,14 +413,15 @@ msg_get(struct conn *conn, bool request, bool redis)
                msg->parser = memcache_parse_rsp;
             }
         }
-        msg->pre_splitcopy = memcache_pre_splitcopy;
-        msg->post_splitcopy = memcache_post_splitcopy;
-        msg->pre_coalesce = memcache_pre_coalesce;
-        msg->post_coalesce = memcache_post_coalesce;
+    } else{
+    	log_debug(LOG_VVERB,"incorrect selection of data store %d", g_data_store);
+    	exit(0);
     }
 
-    log_debug(LOG_VVERB, "get msg %p id %"PRIu64" request %d owner sd %d",
+    if (log_loggable(LOG_VVERB)) {
+       log_debug(LOG_VVERB, "get msg %p id %"PRIu64" request %d owner sd %d",
               msg, msg->id, msg->request, conn->sd);
+    }
 
     return msg;
 }
@@ -332,17 +429,13 @@ msg_get(struct conn *conn, bool request, bool redis)
 rstatus_t 
 msg_clone(struct msg *src, struct mbuf *mbuf_start, struct msg *target)
 {
+    target->parent_id = src->id;
     target->owner = src->owner;
     target->request = src->request;
-    target->redis = src->redis;
 
     target->parser = src->parser;
-    target->pre_splitcopy = src->pre_splitcopy;
-    target->post_splitcopy = src->post_splitcopy; 
-    target->pre_coalesce = src->pre_coalesce;
-    target->post_coalesce = src->post_coalesce;
-
-    target->noreply = src->noreply;
+    target->expect_datastore_reply = src->expect_datastore_reply;
+    target->swallow = src->swallow;
     target->type = src->type;
     target->key_start = src->key_start;
     target->key_end = src->key_end;
@@ -350,6 +443,7 @@ msg_clone(struct msg *src, struct mbuf *mbuf_start, struct msg *target)
     target->pos = src->pos;
     target->vlen = src->vlen;
     target->is_read = src->is_read;
+    target->consistency = src->consistency;
 
     struct mbuf *mbuf, *nbuf;
     bool started = false;
@@ -365,7 +459,7 @@ msg_clone(struct msg *src, struct mbuf *mbuf_start, struct msg *target)
         }
 
         uint32_t len = mbuf_length(mbuf);
-        mbuf_copy(nbuf, mbuf->start, len);
+        mbuf_copy(nbuf, mbuf->pos, len);
         mbuf_insert(&target->mhdr, nbuf);
     }
 
@@ -374,22 +468,16 @@ msg_clone(struct msg *src, struct mbuf *mbuf_start, struct msg *target)
 
 
 struct msg *
-msg_get_error(bool redis, dyn_error_t dyn_err, err_t err)
+msg_get_error(struct conn *conn, dyn_error_t dyn_err, err_t err)
 {
     struct msg *msg;
     struct mbuf *mbuf;
     int n;
-    char *errstr = err ? strerror(err) : "unknown";
-    char *protstr = redis ? "-ERR" : "SERVER_ERROR";
-    char *source;
+    char *errstr = err ? dn_strerror(err) : "unknown";
+    char *protstr = g_data_store == DATA_REDIS ? "-ERR" : "SERVER_ERROR";
+    char *source = dyn_error_source(dyn_err);
 
-    if (dyn_err == PEER_CONNECTION_REFUSE) {
-    	source = "Peer:";
-    } else if (dyn_err == STORAGE_CONNECTION_REFUSE) {
-    	source = "Storage:";
-    }
-
-    msg = _msg_get();
+    msg = _msg_get(conn, __FUNCTION__);
     if (msg == NULL) {
         return NULL;
     }
@@ -408,8 +496,45 @@ msg_get_error(bool redis, dyn_error_t dyn_err, err_t err)
     mbuf->last += n;
     msg->mlen = (uint32_t)n;
 
-    log_debug(LOG_VVERB, "get msg %p id %"PRIu64" len %"PRIu32" error '%s'",
+    if (log_loggable(LOG_VVERB)) {
+       log_debug(LOG_VVERB, "get msg %p id %"PRIu64" len %"PRIu32" error '%s'",
               msg, msg->id, msg->mlen, errstr);
+    }
+
+    return msg;
+}
+
+
+struct msg *
+msg_get_rsp_integer(struct conn *conn)
+{
+    struct msg *msg;
+    struct mbuf *mbuf;
+    int n;
+
+    msg = _msg_get(conn, __FUNCTION__);
+    if (msg == NULL) {
+        return NULL;
+    }
+
+    msg->state = 0;
+    msg->type = MSG_RSP_REDIS_INTEGER;
+
+    mbuf = mbuf_get();
+    if (mbuf == NULL) {
+        msg_put(msg);
+        return NULL;
+    }
+    mbuf_insert(&msg->mhdr, mbuf);
+
+    n = dn_scnprintf(mbuf->last, mbuf_size(mbuf), ":0\r\n");
+    mbuf->last += n;
+    msg->mlen = (uint32_t)n;
+
+    if (log_loggable(LOG_VVERB)) {
+       log_debug(LOG_VVERB, "get msg %p id %"PRIu64" len %"PRIu32" ",
+              msg, msg->id, msg->mlen);
+    }
 
     return msg;
 }
@@ -419,18 +544,31 @@ msg_free(struct msg *msg)
 {
     ASSERT(STAILQ_EMPTY(&msg->mhdr));
 
-    log_debug(LOG_VVERB, "free msg %p id %"PRIu64"", msg, msg->id);
+    if (log_loggable(LOG_VVERB)) {
+       log_debug(LOG_VVERB, "free msg %p id %"PRIu64"", msg, msg->id);
+    }
     dn_free(msg);
 }
 
 void
 msg_put(struct msg *msg)
 {
-    log_debug(LOG_VVERB, "put msg %p id %"PRIu64"", msg, msg->id);
+    if (msg == NULL) {
+   	    log_debug(LOG_ERR, "Unable to put a null msg - probably due to memory hard-set limit");
+   	    return;
+    }
+
+    if (msg->request && msg->awaiting_rsps != 0) {
+        log_error("Not freeing req %d, awaiting_rsps = %u",
+                  msg->id, msg->awaiting_rsps);
+        return;
+    }
+
 
     struct dmsg *dmsg = msg->dmsg;
     if (dmsg != NULL) {
-    	dmsg_put(dmsg);
+        dmsg_put(dmsg);
+        msg->dmsg = NULL;
     }
 
     while (!STAILQ_EMPTY(&msg->mhdr)) {
@@ -443,6 +581,32 @@ msg_put(struct msg *msg)
     TAILQ_INSERT_HEAD(&free_msgq, msg, m_tqe);
 }
 
+
+uint32_t msg_mbuf_size(struct msg *msg)
+{
+    uint32_t count = 0;
+    struct mbuf *mbuf;
+
+    STAILQ_FOREACH(mbuf, &msg->mhdr, next) {
+        count++;
+    }
+
+    return count;
+}
+
+uint32_t msg_length(struct msg *msg)
+{
+    uint32_t count = 0;
+    struct mbuf *mbuf;
+
+    STAILQ_FOREACH(mbuf, &msg->mhdr, next) {
+        ASSERT(mbuf->last >= mbuf->start);
+        count += (uint32_t)(mbuf->last - mbuf->start);
+    }
+
+    return count;
+}
+
 void
 msg_dump(struct msg *msg)
 {
@@ -450,8 +614,8 @@ msg_dump(struct msg *msg)
     struct mbuf *mbuf;
 
     if (msg == NULL) {
-    	loga("msg is NULL - cannot display its info");
-    	return;
+        loga("msg is NULL - cannot display its info");
+        return;
     }
 
     loga("msg dump id %"PRIu64" request %d len %"PRIu32" type %d done %d "
@@ -471,13 +635,18 @@ msg_dump(struct msg *msg)
 
 }
 
+/**
+ * Initialize the message queue.
+ * @param[in] nci Dynomite instance.
+ */
 void
-msg_init(void)
+msg_init(struct instance *nci)
 {
     log_debug(LOG_DEBUG, "msg size %d", sizeof(struct msg));
     msg_id = 0;
     frag_id = 0;
     nfree_msgq = 0;
+    alloc_msgs_max = nci->alloc_msgs_max;
     TAILQ_INIT(&free_msgq);
     rbtree_init(&tmo_rbt, &tmo_rbs);
 }
@@ -489,7 +658,7 @@ msg_deinit(void)
 
     for (msg = TAILQ_FIRST(&free_msgq); msg != NULL;
          msg = nmsg, nfree_msgq--) {
-        ASSERT(nfree_msgq > 0);
+        ASSERT(nfree_msgq);
         nmsg = TAILQ_NEXT(msg, m_tqe);
         msg_free(msg);
     }
@@ -499,7 +668,41 @@ msg_deinit(void)
 bool
 msg_empty(struct msg *msg)
 {
-    return msg->mlen == 0 ? true : false;
+    return msg->mlen == 0 ? true : (msg->dyn_error == BAD_FORMAT? true : false);
+}
+
+uint32_t
+msg_payload_crc32(struct msg *msg)
+{
+    ASSERT(msg != NULL);
+    // take a continous buffer crc
+    uint32_t crc = 0;
+    struct mbuf *mbuf;
+    /* Since we want to checksum only the payload, we have to start from the
+       payload offset. which is somewhere in the mbufs. Skip the mbufs till we
+       find the start of the payload. If there is no dyno header, we start from
+       the beginning of the first mbuf */
+    bool start_found = msg->dmsg ? false : true;
+
+    STAILQ_FOREACH(mbuf, &msg->mhdr, next) {
+        uint8_t *start = mbuf->start;
+        uint8_t *end = mbuf->last;
+        if (!start_found) {
+            // if payload start is within this mbuf
+            if ((mbuf->start <= msg->dmsg->payload) &&
+                (msg->dmsg->payload < mbuf->last)) {
+                start = msg->dmsg->payload;
+                start_found = true;
+            } else {
+                // else skip this mbuf
+                continue;
+            }
+        }
+
+        crc = crc32_sz((char *)start, end - start, crc);
+    }
+    return crc;
+
 }
 
 static rstatus_t
@@ -509,11 +712,13 @@ msg_parsed(struct context *ctx, struct conn *conn, struct msg *msg)
     struct mbuf *mbuf, *nbuf;
 
     mbuf = STAILQ_LAST(&msg->mhdr, mbuf, next);
+
     if (msg->pos == mbuf->last) {
-        /* no more data to parse */
-        conn->recv_done(ctx, conn, msg, NULL);
-        return DN_OK;
-    }
+       /* no more data to parse */
+       conn_recv_done(ctx, conn, msg, NULL);
+       return DN_OK;
+     }
+
 
     /*
      * Input mbuf has un-parsed data. Split mbuf of the current message msg
@@ -526,7 +731,7 @@ msg_parsed(struct context *ctx, struct conn *conn, struct msg *msg)
         return DN_ENOMEM;
     }
 
-    nmsg = msg_get(msg->owner, msg->request, conn->redis);
+    nmsg = msg_get(msg->owner, msg->request, __FUNCTION__);
     if (nmsg == NULL) {
         mbuf_put(nbuf);
         return DN_ENOMEM;
@@ -538,7 +743,7 @@ msg_parsed(struct context *ctx, struct conn *conn, struct msg *msg)
     nmsg->mlen = mbuf_length(nbuf);
     msg->mlen -= nmsg->mlen;
 
-    conn->recv_done(ctx, conn, msg, nmsg);
+    conn_recv_done(ctx, conn, msg, nmsg);
 
     return DN_OK;
 }
@@ -550,21 +755,22 @@ msg_fragment(struct context *ctx, struct conn *conn, struct msg *msg)
     struct msg *nmsg;  /* new message */
     struct mbuf *nbuf; /* new mbuf */
 
-    ASSERT((conn->client && !conn->proxy) || (conn->dnode_client && !conn->dnode_server));
+    ASSERT((conn->type == CONN_CLIENT) ||
+           (conn->type == CONN_DNODE_PEER_CLIENT));
     ASSERT(msg->request);
 
-    nbuf = mbuf_split(&msg->mhdr, msg->pos, msg->pre_splitcopy, msg);
+    nbuf = mbuf_split(&msg->mhdr, msg->pos, g_pre_splitcopy, msg);
     if (nbuf == NULL) {
         return DN_ENOMEM;
     }
 
-    status = msg->post_splitcopy(msg);
+    status = g_post_splitcopy(msg);
     if (status != DN_OK) {
         mbuf_put(nbuf);
         return status;
     }
 
-    nmsg = msg_get(msg->owner, msg->request, msg->redis);
+    nmsg = msg_get(msg->owner, msg->request, __FUNCTION__);
     if (nmsg == NULL) {
         mbuf_put(nbuf);
         return DN_ENOMEM;
@@ -583,7 +789,7 @@ msg_fragment(struct context *ctx, struct conn *conn, struct msg *msg)
      * last_fragment identify first and last fragment respectively.
      *
      * For example, a message vector given below is split into 3 fragments:
-     *  'get key1 key2 key3\r\n'
+     *  'mget key1 key2 key3\r\n'
      *  Or,
      *  '*4\r\n$4\r\nmget\r\n$4\r\nkey1\r\n$4\r\nkey2\r\n$4\r\nkey3\r\n'
      *
@@ -629,15 +835,17 @@ msg_fragment(struct context *ctx, struct conn *conn, struct msg *msg)
     msg->frag_owner->nfrag++;
 
     if (!conn->dyn_mode) {
-       stats_pool_incr(ctx, conn->owner, fragments);
+       stats_pool_incr(ctx, fragments);
     } else {
-    	
+        
     }
 
-    log_debug(LOG_VERB, "fragment msg into %"PRIu64" and %"PRIu64" frag id "
+    if (log_loggable(LOG_VERB)) {
+       log_debug(LOG_VERB, "fragment msg into %"PRIu64" and %"PRIu64" frag id "
               "%"PRIu64"", msg->id, nmsg->id, msg->frag_id);
+    }
 
-    conn->recv_done(ctx, conn, msg, nmsg);
+    conn_recv_done(ctx, conn, msg, nmsg);
 
     return DN_OK;
 }
@@ -657,6 +865,7 @@ msg_repair(struct context *ctx, struct conn *conn, struct msg *msg)
     return DN_OK;
 }
 
+
 static rstatus_t
 msg_parse(struct context *ctx, struct conn *conn, struct msg *msg)
 {
@@ -664,7 +873,7 @@ msg_parse(struct context *ctx, struct conn *conn, struct msg *msg)
 
     if (msg_empty(msg)) {
         /* no data to parse */
-        conn->recv_done(ctx, conn, msg, NULL);
+        conn_recv_done(ctx, conn, msg, NULL);
         return DN_OK;
     }
 
@@ -672,22 +881,35 @@ msg_parse(struct context *ctx, struct conn *conn, struct msg *msg)
 
     switch (msg->result) {
     case MSG_PARSE_OK:
+        //log_debug(LOG_VVERB, "MSG_PARSE_OK");
         status = msg_parsed(ctx, conn, msg);
         break;
 
     case MSG_PARSE_FRAGMENT:
+        //log_debug(LOG_VVERB, "MSG_PARSE_FRAGMENT");
         status = msg_fragment(ctx, conn, msg);
         break;
 
     case MSG_PARSE_REPAIR:
+        //log_debug(LOG_VVERB, "MSG_PARSE_REPAIR");
         status = msg_repair(ctx, conn, msg);
         break;
 
     case MSG_PARSE_AGAIN:
+        //log_debug(LOG_VVERB, "MSG_PARSE_AGAIN");
         status = DN_OK;
         break;
 
     default:
+        /*
+        if (!conn->dyn_mode) {
+            status = DN_ERROR;
+            conn->err = errno;
+        } else {
+            log_debug(LOG_VVERB, "Parsing error in dyn_mode");
+            status = DN_OK;
+        }
+        */
         status = DN_ERROR;
         conn->err = errno;
         break;
@@ -695,6 +917,7 @@ msg_parse(struct context *ctx, struct conn *conn, struct msg *msg)
 
     return conn->err != 0 ? DN_ERROR : status;
 }
+
 
 static rstatus_t
 msg_recv_chain(struct context *ctx, struct conn *conn, struct msg *msg)
@@ -705,20 +928,34 @@ msg_recv_chain(struct context *ctx, struct conn *conn, struct msg *msg)
     size_t msize;
     ssize_t n;
 
+    int expected_fill =
+        ((msg->dyn_state == DYN_DONE || msg->dyn_state == DYN_POST_DONE) &&
+         msg->dmsg->bit_field == 1) ? msg->dmsg->plen : -1;  //used in encryption case only
+
     mbuf = STAILQ_LAST(&msg->mhdr, mbuf, next);
-    if (mbuf == NULL || mbuf_full(mbuf)) {
+    if (mbuf == NULL || mbuf_full(mbuf) ||
+        (expected_fill != -1 && mbuf->last == mbuf->end_extra)) {
         mbuf = mbuf_get();
         if (mbuf == NULL) {
             return DN_ENOMEM;
         }
         mbuf_insert(&msg->mhdr, mbuf);
+
         msg->pos = mbuf->pos;
     }
-    ASSERT(mbuf->end - mbuf->last > 0);
 
-    msize = mbuf_size(mbuf);
+    ASSERT(mbuf->end_extra - mbuf->last > 0);
 
-    n = conn_recv(conn, mbuf->last, msize);
+    if (expected_fill == -1) {
+        msize = mbuf_size(mbuf);
+    } else {
+        msize = (msg->dmsg->plen <= mbuf->end_extra - mbuf->last) ?
+                                     msg->dmsg->plen :
+                                     mbuf->end_extra - mbuf->last;
+    }
+
+    n = conn_recv_data(conn, mbuf->last, msize);
+
     if (n < 0) {
         if (n == DN_EAGAIN) {
             return DN_OK;
@@ -726,9 +963,61 @@ msg_recv_chain(struct context *ctx, struct conn *conn, struct msg *msg)
         return DN_ERROR;
     }
 
-    ASSERT((mbuf->last + n) <= mbuf->end);
+    ASSERT((mbuf->last + n) <= mbuf->end_extra);
     mbuf->last += n;
     msg->mlen += (uint32_t)n;
+
+    //Only used in encryption case
+    if (expected_fill != -1) {
+        if ( n >=  msg->dmsg->plen  || mbuf->end_extra == mbuf->last) {
+            //log_debug(LOG_VERB, "About to decrypt this mbuf as it is full or eligible!");
+            struct mbuf *nbuf = NULL;
+
+            if (n >=  msg->dmsg->plen) {
+                nbuf = mbuf_get();
+
+                if (nbuf == NULL) {
+                    loga("Not enough memory error!!!");
+                    return DN_ENOMEM;
+                }
+
+                status = dyn_aes_decrypt(mbuf->start, mbuf->last - mbuf->start, nbuf, msg->owner->aes_key);
+                if (status == DN_OK) {
+                    int remain = n - msg->dmsg->plen;
+                    uint8_t *pos = mbuf->last - remain;
+                    mbuf_copy(nbuf, pos, remain);
+                }
+
+            } else if (mbuf->end_extra == mbuf->last) {
+                nbuf = mbuf_get();
+
+                if (nbuf == NULL) {
+                    loga("Not enough memory error!!!");
+                    return DN_ENOMEM;
+                }
+
+                status = dyn_aes_decrypt(mbuf->start, mbuf->last - mbuf->start, nbuf, msg->owner->aes_key);
+            }
+
+            if (status != DN_ERROR && nbuf != NULL) {
+                nbuf->read_flip = 1;
+                mbuf_remove(&msg->mhdr, mbuf);
+                mbuf_insert(&msg->mhdr, nbuf);
+                msg->pos = nbuf->start;
+
+                msg->mlen -= mbuf->last - mbuf->start;
+                msg->mlen += nbuf->last - nbuf->start;
+
+                mbuf_put(mbuf);
+            } else { //clean up the mess and recover it
+                mbuf_insert(&msg->mhdr, nbuf);
+                msg->pos = nbuf->last;
+                msg->dyn_error = BAD_FORMAT;
+            }
+        }
+
+        msg->dmsg->plen -= n;
+    }
 
     for (;;) {
         status = msg_parse(ctx, conn, msg);
@@ -737,7 +1026,7 @@ msg_recv_chain(struct context *ctx, struct conn *conn, struct msg *msg)
         }
 
         /* get next message to parse */
-        nmsg = conn->recv_next(ctx, conn, false);
+        nmsg = conn_recv_next(ctx, conn, false);
         if (nmsg == NULL || nmsg == msg) {
             /* no more data to parse */
             break;
@@ -756,10 +1045,10 @@ msg_recv(struct context *ctx, struct conn *conn)
     struct msg *msg;
 
     ASSERT(conn->recv_active);
-
     conn->recv_ready = 1;
+
     do {
-        msg = conn->recv_next(ctx, conn, true);
+        msg = conn_recv_next(ctx, conn, true);
         if (msg == NULL) {
             return DN_OK;
         }
@@ -768,6 +1057,7 @@ msg_recv(struct context *ctx, struct conn *conn)
         if (status != DN_OK) {
             return status;
         }
+
     } while (conn->recv_ready);
 
     return DN_OK;
@@ -786,10 +1076,10 @@ msg_send_chain(struct context *ctx, struct conn *conn, struct msg *msg)
     size_t limit;                        /* bytes to send limit */
     ssize_t n;                           /* bytes sent by sendv */
 
-#ifdef DN_DEBUG_LOG
-    loga("About to dump out the content of msg");
-    msg_dump(msg);
-#endif
+    if (log_loggable(LOG_VVERB)) {
+       loga("About to dump out the content of msg");
+       msg_dump(msg);
+    }
 
     TAILQ_INIT(&send_msgq);
 
@@ -810,10 +1100,9 @@ msg_send_chain(struct context *ctx, struct conn *conn, struct msg *msg)
 
         TAILQ_INSERT_TAIL(&send_msgq, msg, m_tqe);
 
-        for (mbuf = STAILQ_FIRST(&msg->mhdr);
-             mbuf != NULL && array_n(&sendv) < DN_IOV_MAX && nsend < limit;
-             mbuf = nbuf) {
-            nbuf = STAILQ_NEXT(mbuf, next);
+        STAILQ_FOREACH(mbuf, &msg->mhdr, next) {
+            if (!(array_n(&sendv) < DN_IOV_MAX) && (nsend < limit))
+                break;
 
             if (mbuf_empty(mbuf)) {
                 continue;
@@ -835,7 +1124,7 @@ msg_send_chain(struct context *ctx, struct conn *conn, struct msg *msg)
             break;
         }
 
-        msg = conn->send_next(ctx, conn);
+        msg = conn_send_next(ctx, conn);
         if (msg == NULL) {
             break;
         }
@@ -845,20 +1134,18 @@ msg_send_chain(struct context *ctx, struct conn *conn, struct msg *msg)
 
     conn->smsg = NULL;
 
-    n = conn_sendv(conn, &sendv, nsend);
+    n = conn_sendv_data(conn, &sendv, nsend);
 
     nsent = n > 0 ? (size_t)n : 0;
 
     /* postprocess - process sent messages in send_msgq */
-
-    for (msg = TAILQ_FIRST(&send_msgq); msg != NULL; msg = nmsg) {
-        nmsg = TAILQ_NEXT(msg, m_tqe);
+    TAILQ_FOREACH_SAFE(msg, &send_msgq, m_tqe, nmsg) {
 
         TAILQ_REMOVE(&send_msgq, msg, m_tqe);
 
         if (nsent == 0) {
             if (msg->mlen == 0) {
-                conn->send_done(ctx, conn, msg);
+                conn_send_done(ctx, conn, msg);
             }
             continue;
         }
@@ -887,7 +1174,7 @@ msg_send_chain(struct context *ctx, struct conn *conn, struct msg *msg)
 
         /* message has been sent completely, finalize it */
         if (mbuf == NULL) {
-            conn->send_done(ctx, conn, msg);
+            conn_send_done(ctx, conn, msg);
         }
     }
 
@@ -910,7 +1197,7 @@ msg_send(struct context *ctx, struct conn *conn)
 
     conn->send_ready = 1;
     do {
-        msg = conn->send_next(ctx, conn);
+        msg = conn_send_next(ctx, conn);
         if (msg == NULL) {
             /* nothing to send */
             return DN_OK;
@@ -921,7 +1208,114 @@ msg_send(struct context *ctx, struct conn *conn)
             return status;
         }
 
+        if (conn->omsg_count > MAX_CONN_QUEUE_SIZE) {
+            conn->send_ready = 0;
+            conn->err = ENOTRECOVERABLE;
+            loga("Setting ENOTRECOVERABLE happens here!");
+        }
+
     } while (conn->send_ready);
+
+    return DN_OK;
+}
+
+struct mbuf *
+msg_ensure_mbuf(struct msg *msg, size_t len)
+{
+    struct mbuf *mbuf;
+
+    if (STAILQ_EMPTY(&msg->mhdr) ||
+        mbuf_size(STAILQ_LAST(&msg->mhdr, mbuf, next)) < len) {
+        mbuf = mbuf_get();
+        if (mbuf == NULL) {
+            return NULL;
+        }
+        mbuf_insert(&msg->mhdr, mbuf);
+    } else {
+        mbuf = STAILQ_LAST(&msg->mhdr, mbuf, next);
+    }
+
+    return mbuf;
+}
+
+
+/*
+ * Append n bytes of data, with n <= mbuf_size(mbuf)
+ * into mbuf
+ */
+rstatus_t
+msg_append(struct msg *msg, uint8_t *pos, size_t n)
+{
+    struct mbuf *mbuf;
+
+    ASSERT(n <= mbuf_data_size());
+
+    mbuf = msg_ensure_mbuf(msg, n);
+    if (mbuf == NULL) {
+        return DN_ENOMEM;
+    }
+
+    ASSERT(n <= mbuf_size(mbuf));
+
+    mbuf_copy(mbuf, pos, n);
+    msg->mlen += (uint32_t)n;
+
+    return DN_OK;
+}
+
+/*
+ * Prepend n bytes of data, with n <= mbuf_size(mbuf)
+ * into mbuf
+ */
+rstatus_t
+msg_prepend(struct msg *msg, uint8_t *pos, size_t n)
+{
+    struct mbuf *mbuf;
+
+    mbuf = mbuf_get();
+    if (mbuf == NULL) {
+        return DN_ENOMEM;
+    }
+
+    ASSERT(n <= mbuf_size(mbuf));
+
+    mbuf_copy(mbuf, pos, n);
+    msg->mlen += (uint32_t)n;
+
+    STAILQ_INSERT_HEAD(&msg->mhdr, mbuf, next);
+
+    return DN_OK;
+}
+
+/*
+ * Prepend a formatted string into msg. Returns an error if the formatted
+ * string does not fit in a single mbuf.
+ */
+rstatus_t
+msg_prepend_format(struct msg *msg, const char *fmt, ...)
+{
+    struct mbuf *mbuf;
+    int n;
+    uint32_t size;
+    va_list args;
+
+    mbuf = mbuf_get();
+    if (mbuf == NULL) {
+        return DN_ENOMEM;
+    }
+
+    size = mbuf_size(mbuf);
+
+    va_start(args, fmt);
+    n = dn_vscnprintf(mbuf->last, size, fmt, args);
+    va_end(args);
+    if (n <= 0 || n >= (int)size) {
+        return DN_ERROR;
+    }
+
+    mbuf->last += n;
+    msg->mlen += (uint32_t)n;
+    STAILQ_INSERT_HEAD(&msg->mhdr, mbuf, next);
 
     return DN_OK;
 }

@@ -26,33 +26,33 @@
 #include "dyn_server.h"
 #include "dyn_proxy.h"
 
-void
+static void
 proxy_ref(struct conn *conn, void *owner)
 {
     struct server_pool *pool = owner;
 
-    ASSERT(!conn->client && conn->proxy);
+    ASSERT(conn->type == CONN_PROXY);
     ASSERT(conn->owner == NULL);
 
-    conn->family = pool->family;
-    conn->addrlen = pool->addrlen;
-    conn->addr = pool->addr;
+    conn->family = pool->proxy_endpoint.family;
+    conn->addrlen = pool->proxy_endpoint.addrlen;
+    conn->addr = pool->proxy_endpoint.addr;
+    string_duplicate(&conn->pname, &pool->proxy_endpoint.pname);
 
     pool->p_conn = conn;
 
     /* owner of the proxy connection is the server pool */
     conn->owner = owner;
 
-    log_debug(LOG_VVERB, "ref conn %p owner %p into pool %"PRIu32"", conn,
-              pool, pool->idx);
+    log_debug(LOG_VVERB, "ref conn %p owner %p", conn, pool);
 }
 
-void
+static void
 proxy_unref(struct conn *conn)
 {
     struct server_pool *pool;
 
-    ASSERT(!conn->client && conn->proxy);
+    ASSERT(conn->type == CONN_PROXY);
     ASSERT(conn->owner != NULL);
 
     pool = conn->owner;
@@ -60,19 +60,18 @@ proxy_unref(struct conn *conn)
 
     pool->p_conn = NULL;
 
-    log_debug(LOG_VVERB, "unref conn %p owner %p from pool %"PRIu32"", conn,
-              pool, pool->idx);
+    log_debug(LOG_VVERB, "unref conn %p owner %p", conn, pool);
 }
 
-void
+static void
 proxy_close(struct context *ctx, struct conn *conn)
 {
     rstatus_t status;
 
-    ASSERT(!conn->client && conn->proxy);
+    ASSERT(conn->type == CONN_PROXY);
 
     if (conn->sd < 0) {
-        conn->unref(conn);
+        conn_unref(conn);
         conn_put(conn);
         return;
     }
@@ -82,7 +81,7 @@ proxy_close(struct context *ctx, struct conn *conn)
     ASSERT(TAILQ_EMPTY(&conn->imsg_q));
     ASSERT(TAILQ_EMPTY(&conn->omsg_q));
 
-    conn->unref(conn);
+    conn_unref(conn);
 
     status = close(conn->sd);
     if (status < 0) {
@@ -93,155 +92,36 @@ proxy_close(struct context *ctx, struct conn *conn)
     conn_put(conn);
 }
 
-static rstatus_t
-proxy_reuse(struct conn *p)
-{
-    rstatus_t status;
-    struct sockaddr_un *un;
-
-    switch (p->family) {
-    case AF_INET:
-    case AF_INET6:
-        status = dn_set_reuseaddr(p->sd);
-        break;
-
-    case AF_UNIX:
-        /*
-         * bind() will fail if the pathname already exist. So, we call unlink()
-         * to delete the pathname, in case it already exists. If it does not
-         * exist, unlink() returns error, which we ignore
-         */
-        un = (struct sockaddr_un *) p->addr;
-        unlink(un->sun_path);
-        status = DN_OK;
-        break;
-
-    default:
-        NOT_REACHED();
-        status = DN_ERROR;
-    }
-
-    return status;
-}
-
-static rstatus_t
-proxy_listen(struct context *ctx, struct conn *p)
-{
-    rstatus_t status;
-    struct server_pool *pool = p->owner;
-
-    ASSERT(p->proxy);
-
-    p->sd = socket(p->family, SOCK_STREAM, 0);
-    if (p->sd < 0) {
-        log_error("socket failed: %s", strerror(errno));
-        return DN_ERROR;
-    }
-
-    status = proxy_reuse(p);
-    if (status < 0) {
-        log_error("reuse of addr '%.*s' for listening on p %d failed: %s",
-                  pool->addrstr.len, pool->addrstr.data, p->sd,
-                  strerror(errno));
-        return DN_ERROR;
-    }
-
-    status = bind(p->sd, p->addr, p->addrlen);
-    if (status < 0) {
-        log_error("bind on p %d to addr '%.*s' failed: %s", p->sd,
-                  pool->addrstr.len, pool->addrstr.data, strerror(errno));
-        return DN_ERROR;
-    }
-
-    status = listen(p->sd, pool->backlog);
-    if (status < 0) {
-        log_error("listen on p %d on addr '%.*s' failed: %s", p->sd,
-                  pool->addrstr.len, pool->addrstr.data, strerror(errno));
-        return DN_ERROR;
-    }
-
-    status = dn_set_nonblocking(p->sd);
-    if (status < 0) {
-        log_error("set nonblock on p %d on addr '%.*s' failed: %s", p->sd,
-                  pool->addrstr.len, pool->addrstr.data, strerror(errno));
-        return DN_ERROR;
-    }
-
-    status = event_add_conn(ctx->evb, p);
-    if (status < 0) {
-        log_error("event add conn p %d on addr '%.*s' failed: %s",
-                  p->sd, pool->addrstr.len, pool->addrstr.data,
-                  strerror(errno));
-        return DN_ERROR;
-    }
-
-    status = event_del_out(ctx->evb, p);
-    if (status < 0) {
-        log_error("event del out p %d on addr '%.*s' failed: %s",
-                  p->sd, pool->addrstr.len, pool->addrstr.data,
-                  strerror(errno));
-        return DN_ERROR;
-    }
-
-    return DN_OK;
-}
-
-rstatus_t
-proxy_each_init(void *elem, void *data)
-{
-    rstatus_t status;
-    struct server_pool *pool = elem;
-    struct conn *p;
-
-    p = conn_get_proxy(pool);
-    if (p == NULL) {
-        return DN_ENOMEM;
-    }
-
-    status = proxy_listen(pool->ctx, p);
-    if (status != DN_OK) {
-        p->close(pool->ctx, p);
-        return status;
-    }
-
-    log_debug(LOG_NOTICE, "p %d listening on '%.*s' in %s pool %"PRIu32" '%.*s'"
-              " with %"PRIu32" servers", p->sd, pool->addrstr.len,
-              pool->addrstr.data, pool->redis ? "redis" : "memcache",
-              pool->idx, pool->name.len, pool->name.data,
-              array_n(&pool->server));
-
-    return DN_OK;
-}
-
 rstatus_t
 proxy_init(struct context *ctx)
 {
     rstatus_t status;
+    struct server_pool *pool = &ctx->pool;
 
-    ASSERT(array_n(&ctx->pool) != 0);
+    struct conn *p = conn_get_proxy(pool);
+    if (!p) {
+        return DN_ENOMEM;
+    }
 
-    status = array_each(&ctx->pool, proxy_each_init, NULL);
+    status = conn_listen(pool->ctx, p);
     if (status != DN_OK) {
-        proxy_deinit(ctx);
+        conn_close(pool->ctx, p);
         return status;
     }
 
-    log_debug(LOG_VVERB, "init proxy with %"PRIu32" pools",
-              array_n(&ctx->pool));
-
-    return DN_OK;
-}
-
-rstatus_t
-proxy_each_deinit(void *elem, void *data)
-{
-    struct server_pool *pool = elem;
-    struct conn *p;
-
-    p = pool->p_conn;
-    if (p != NULL) {
-        p->close(pool->ctx, p);
+    char * log_datastore = "not selected data store";
+    if (g_data_store == DATA_REDIS){
+    	log_datastore = "redis";
     }
+    else if (g_data_store == DATA_MEMCACHE){
+    	log_datastore = "memcache";
+    }
+
+    log_debug(LOG_NOTICE, "p %d listening on '%.*s' in %s pool '%.*s'",
+              p->sd, pool->proxy_endpoint.pname.len,
+              pool->proxy_endpoint.pname.data,
+			  log_datastore,
+              pool->name.len, pool->name.data);
 
     return DN_OK;
 }
@@ -249,17 +129,14 @@ proxy_each_deinit(void *elem, void *data)
 void
 proxy_deinit(struct context *ctx)
 {
-    rstatus_t status;
-
-    ASSERT(array_n(&ctx->pool) != 0);
-
-    status = array_each(&ctx->pool, proxy_each_deinit, NULL);
-    if (status != DN_OK) {
-        return;
+    struct server_pool *pool = &ctx->pool;
+    struct conn *p = pool->p_conn;
+    if (p != NULL) {
+        conn_close(pool->ctx, p);
+        pool->p_conn = NULL;
     }
 
-    log_debug(LOG_VVERB, "deinit proxy with %"PRIu32" pools",
-              array_n(&ctx->pool));
+    log_debug(LOG_VVERB, "deinit proxy");
 }
 
 static rstatus_t
@@ -269,7 +146,7 @@ proxy_accept(struct context *ctx, struct conn *p)
     struct conn *c;
     int sd;
 
-    ASSERT(p->proxy && !p->client);
+    ASSERT(p->type == CONN_PROXY);
     ASSERT(p->sd > 0);
     ASSERT(p->recv_active && p->recv_ready);
 
@@ -277,12 +154,12 @@ proxy_accept(struct context *ctx, struct conn *p)
         sd = accept(p->sd, NULL, NULL);
         if (sd < 0) {
             if (errno == EINTR) {
-                log_debug(LOG_VERB, "accept on p %d not ready - eintr", p->sd);
+                log_warn("accept on %s %d not ready - eintr",
+                         conn_get_type_string(p), p->sd);
                 continue;
             }
 
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                log_debug(LOG_VERB, "accept on p %d not ready - eagain", p->sd);
                 p->recv_ready = 0;
                 return DN_OK;
             }
@@ -292,17 +169,18 @@ proxy_accept(struct context *ctx, struct conn *p)
              * it back in when some existing connection gets closed
              */
 
-            log_error("accept on p %d failed: %s", p->sd, strerror(errno));
+            log_error("accept on %s %d failed: %s",
+                      conn_get_type_string(p), p->sd, strerror(errno));
             return DN_ERROR;
         }
 
         break;
     }
 
-    c = conn_get(p->owner, true, p->redis);
+    c = conn_get(p->owner, true);
     if (c == NULL) {
-        log_error("get conn for c %d from p %d failed: %s", sd, p->sd,
-                  strerror(errno));
+        log_error("get conn for CLIENT %d from %s %d failed: %s", sd,
+                  conn_get_type_string(p), p->sd, strerror(errno));
         status = close(sd);
         if (status < 0) {
             log_error("close c %d failed, ignored: %s", sd, strerror(errno));
@@ -311,44 +189,45 @@ proxy_accept(struct context *ctx, struct conn *p)
     }
     c->sd = sd;
 
-    stats_pool_incr(ctx, c->owner, client_connections);
+    stats_pool_incr(ctx, client_connections);
 
     status = dn_set_nonblocking(c->sd);
     if (status < 0) {
-        log_error("set nonblock on c %d from p %d failed: %s", c->sd, p->sd,
-                  strerror(errno));
-        c->close(ctx, c);
+        log_error("set nonblock on %s %d from p %d failed: %s",
+                  conn_get_type_string(c), c->sd, p->sd, strerror(errno));
+        conn_close(ctx, c);
         return status;
     }
 
     if (p->family == AF_INET || p->family == AF_INET6) {
         status = dn_set_tcpnodelay(c->sd);
         if (status < 0) {
-            log_warn("set tcpnodelay on c %d from p %d failed, ignored: %s",
-                     c->sd, p->sd, strerror(errno));
+            log_warn("set tcpnodelay on %s %d from %s %d failed, ignored: %s",
+                     conn_get_type_string(c), c->sd, conn_get_type_string(p),
+                     p->sd, strerror(errno));
         }
     }
 
     status = event_add_conn(ctx->evb, c);
     if (status < 0) {
-        log_error("event add conn from p %d failed: %s", p->sd,
-                  strerror(errno));
-        c->close(ctx, c);
+        log_error("event add conn from %s %d failed: %s",conn_get_type_string(p),
+                  p->sd, strerror(errno));
+        conn_close(ctx, c);
         return status;
     }
 
-    log_debug(LOG_NOTICE, "accepted c %d on p %d from '%s'", c->sd, p->sd,
-              dn_unresolve_peer_desc(c->sd));
+    log_notice("accepted %s %d on %s %d from '%s'", conn_get_type_string(c),
+               c->sd, conn_get_type_string(p), p->sd, dn_unresolve_peer_desc(c->sd));
 
     return DN_OK;
 }
 
-rstatus_t
+static rstatus_t
 proxy_recv(struct context *ctx, struct conn *conn)
 {
     rstatus_t status;
 
-    ASSERT(conn->proxy && !conn->client);
+    ASSERT(conn->type == CONN_PROXY);
     ASSERT(conn->recv_active);
 
     conn->recv_ready = 1;
@@ -361,3 +240,30 @@ proxy_recv(struct context *ctx, struct conn *conn)
 
     return DN_OK;
 }
+
+struct conn_ops proxy_ops = {
+    proxy_recv,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    proxy_close,
+    NULL,
+    proxy_ref,
+    proxy_unref,
+    // enqueue, dequeues
+    NULL,
+    NULL,
+    NULL,
+    NULL,
+    conn_cant_handle_response
+};
+
+void
+init_proxy_conn(struct conn *conn)
+{
+    conn->type = CONN_PROXY;
+    conn->ops = &proxy_ops;
+}
+

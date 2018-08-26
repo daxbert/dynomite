@@ -37,7 +37,7 @@ vnode_item_cmp(const void *t1, const void *t2)
     return cmp_dyn_token(ct1->token, ct2->token);
 }
 
-rstatus_t
+static rstatus_t
 vnode_rack_verify_continuum(void *elem, void *data)
 {
     struct rack *rack = elem;
@@ -60,18 +60,14 @@ vnode_update(struct server_pool *sp)
 {
     ASSERT(array_n(&sp->peers) > 0);
 
-    int64_t now = dn_usec_now();
-    if (now < 0) {
-        return DN_ERROR;
-    }
-
     int i, len;
     for (i = 0, len = array_n(&sp->peers); i < len; i++) {
-        struct server *peer = array_get(&sp->peers, i);
-        struct rack *rack = server_get_rack(sp, &peer->rack, &peer->dc);
+        struct node *peer = array_get(&sp->peers, i);
 
-        //log_debug(LOG_VERB, "peer        : '%.*s'", peer->name.len, peer->name.data);
-        //log_debug(LOG_VERB, "peer->processed = %d", peer->processed);
+        log_debug(LOG_VERB, "peer name       : '%.*s'", peer->name.len, peer->name.data);
+        log_debug(LOG_VERB, "peer rack       : '%.*s'", peer->rack.len, peer->rack.data);
+        log_debug(LOG_VERB, "peer dc       : '%.*s'", peer->dc.len, peer->dc.data);
+        log_debug(LOG_VERB, "peer->processed = %d", peer->processed);
 
         //update its own state
         if (i == 0) {
@@ -80,18 +76,14 @@ vnode_update(struct server_pool *sp)
 
         if (peer->processed) {
             continue;
-        } else {
-            peer->processed = 1;
         }
 
-        if (rack == NULL) {
-        	log_debug(LOG_VERB, "Creating a new rack");
-            rack = array_push(&sp->racks);
-            rack_init(rack);
-            string_copy(rack->name, peer->rack.data, peer->rack.len);
-            string_copy(rack->dc, peer->dc.data, peer->dc.len);
-            rack->continuum = dn_alloc(sizeof(struct continuum));
-        }
+        peer->processed = 1;
+
+        struct datacenter *dc = server_get_dc(sp, &peer->dc);
+        struct rack *rack = server_get_rack(dc, &peer->rack);
+
+        ASSERT(rack != NULL);
 
         uint32_t token_cnt = array_n(&peer->tokens);
         uint32_t orig_cnt = rack->nserver_continuum;
@@ -116,12 +108,15 @@ vnode_update(struct server_pool *sp)
             c->token = array_get(&peer->tokens, j);
             rack->ncontinuum++;
         }
+
+        if (array_n(&dc->racks) != 0) {
+             rstatus_t status = array_each(&dc->racks, vnode_rack_verify_continuum, NULL);
+             if (status != DN_OK) {
+                  return status;
+             }
+        }
     }
 
-    rstatus_t status = array_each(&sp->racks, vnode_rack_verify_continuum, NULL);
-    if (status != DN_OK) {
-        return status;
-    }
 
     return DN_OK;
 }
@@ -130,13 +125,13 @@ vnode_update(struct server_pool *sp)
 uint32_t
 vnode_dispatch(struct continuum *continuum, uint32_t ncontinuum, struct dyn_token *token)
 {
-    struct continuum *begin, *end, *left, *right, *middle;
+    struct continuum *left, *right, *middle;
 
     ASSERT(continuum != NULL);
     ASSERT(ncontinuum != 0);
 
-    begin = left = continuum;
-    end = right = continuum + ncontinuum - 1;
+    left = continuum;
+    right = continuum + ncontinuum - 1;
 
     if (cmp_dyn_token(right->token, token) < 0 || cmp_dyn_token(left->token, token) >= 0)
         return left->index;

@@ -24,11 +24,11 @@
 #include "dyn_core.h"
 
 
-#define RSA_KEYLEN 2048
 #define AES_KEYLEN 32
-#define AES_ENCRYPTED_KEYLEN 128
 
-rstatus_t crypto_init(struct context *ctx);
+
+rstatus_t crypto_init(struct server_pool *sp);
+rstatus_t crypto_init_for_test(void);
 rstatus_t crypto_deinit(void);
 
 char* base64_encode(const unsigned char *message, const size_t length);
@@ -44,13 +44,14 @@ rstatus_t dyn_aes_encrypt(const unsigned char *msg, size_t msgLen,
 rstatus_t dyn_aes_decrypt(unsigned char *encMsg, size_t encMsgLen,
 		                  struct mbuf *mbuf, unsigned char *aes_key);
 
+rstatus_t dyn_aes_encrypt_msg(struct msg *msg, unsigned char *aes_key);
 unsigned char* generate_aes_key(void);
+
+int dyn_rsa_size(void);
 
 rstatus_t dyn_rsa_encrypt(unsigned char *plain_msg, unsigned char *encrypted_buf);
 
 rstatus_t dyn_rsa_decrypt(unsigned char *encrypted_msg, unsigned char *decrypted_buf);
 
-
-void crypto_test(void);
 
 #endif /* DYN_CRYPTO_H_ */

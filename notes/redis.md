@@ -15,7 +15,7 @@
     +-------------------+------------+---------------------------------------------------------------------------------------------------------------------+
     |     EXPIREAT      |    Yes     | EXPIREAT key timestamp                                                                                              |
     +-------------------+------------+---------------------------------------------------------------------------------------------------------------------+
-    |       KEYS        |    No      | KEYS pattern                                                                                                        |
+    |       KEYS        |    Yes     | KEYS pattern                                                                                                        |
     +-------------------+------------+---------------------------------------------------------------------------------------------------------------------+
     |      MIGRATE      |    No      | MIGRATE host port key destination-db timeout                                                                        |
     +-------------------+------------+---------------------------------------------------------------------------------------------------------------------+
@@ -45,6 +45,10 @@
     +-------------------+------------+---------------------------------------------------------------------------------------------------------------------+
     |      TYPE         |    Yes     | TYPE key                                                                                                            |
     +-------------------+------------+---------------------------------------------------------------------------------------------------------------------+
+    |      SCAN         |    Yes*    | SCAN cursor [MATCH pattern] [COUNT count]                                                                           |
+    +-------------------+------------+---------------------------------------------------------------------------------------------------------------------+
+
+* SCAN reads only the local node.
 
 ### Strings Command
 
@@ -203,9 +207,12 @@
     +-------------------+------------+---------------------------------------------------------------------------------------------------------------------+
     |   SUNIONSTORE     |    Yes*    | SUNIONSTORE destination key [key ...]                                                                               |
     +-------------------+------------+---------------------------------------------------------------------------------------------------------------------+
+    |      SSCAN        |    Yes**   | SSCAN key cursor [MATCH pattern] [COUNT count]                                                                      |
+    +-------------------+------------+---------------------------------------------------------------------------------------------------------------------+
 
 * SIDFF, SDIFFSTORE, SINTER, SINTERSTORE, SMOVE, SUNION and SUNIONSTORE support requires that the supplied keys hash to the same server. You can ensure this by using the same [hashtag](notes/recommendation.md#hash-tags) for all keys in the command. Dynomite does no checking on its end to verify that all the keys hash to the same server, and the given command is forwarded to the server that the first key hashes to.
 
+** SSCAN scans only sets in the local node.
 
 ### Sorted Sets
 
@@ -244,8 +251,23 @@
     +-------------------+------------+---------------------------------------------------------------------------------------------------------------------+
     |    ZUNIONSTORE    |    Yes*    | ZUNIONSTORE destination numkeys key [key ...] [WEIGHTS weight [weight ...]] [AGGREGATE SUM|MIN|MAX]                 |
     +-------------------+------------+---------------------------------------------------------------------------------------------------------------------+
+    |      ZSCAN        |    Yes**   | ZSCAN key cursor [MATCH pattern] [COUNT count]                                                                      |
+    +-------------------+------------+---------------------------------------------------------------------------------------------------------------------+
 
 * ZINTERSTORE and ZUNIONSTORE support requires that the supplied keys hash to the same server. You can ensure this by using the same [hashtag](notes/recommendation.md#hash-tags) for all keys in the command. Dynomite does no checking on its end to verify that all the keys hash to the same server, and the given command is forwarded to the server that the first key hashes to.
+
+** SSCAN scans only sorted sets in the local node.
+
+## HyperLogLog
+    +-------------------+------------+---------------------------------------------------------------------------------------------------------------------+
+    |      Command      | Supported? | Format                                                                                                              |
+    +-------------------+------------+---------------------------------------------------------------------------------------------------------------------+
+    |     PFADD         |    Yes     | PFADD key element [element...]                                                                                      |
+    +-------------------+------------+---------------------------------------------------------------------------------------------------------------------+
+    |     PFCOUNT       |    Yes     | PFCOUNT key [key...]                                                                                                |
+    +-------------------+------------+---------------------------------------------------------------------------------------------------------------------+
+    |     PFMERGE       |    No      | PFMERGE destkey sourcekey [sourcekey ...]                                                                           |
+    +-------------------+------------+---------------------------------------------------------------------------------------------------------------------+
 
 
 ### Pub/Sub
@@ -298,7 +320,7 @@
     |    SCRIPT LOAD    |    No      | SCRIPT LOAD script                                                                                                  |
     +-------------------+------------+---------------------------------------------------------------------------------------------------------------------+
 
- * EVAL and EVALSHA support is limited to scripts that take at least 1 key. If multiple keys are used, all keys must hash to the same server. You can ensure this by using the same [hashtag](notes/recommendation.md#hash-tags) for all keys. If you use more than 1 key, the proxy does no checking to verify that all keys hash to the same server, and the entire command is forwarded to the server that the first key hashes to
+ * EVAL and EVALSHA support is limited to scripts that take at least 1 key. If multiple keys are used, all keys must hash to the same server. You can ensure this by using the same [hashtag](recommendation.md#hash-tags) for all keys. If you use more than 1 key, the proxy does no checking to verify that all keys hash to the same server, and the entire command is forwarded to the server that the first key hashes to
 
 ### Connection
 
@@ -309,12 +331,14 @@
     +-------------------+------------+---------------------------------------------------------------------------------------------------------------------+
     |       ECHO        |    No      | ECHO message                                                                                                        |
     +-------------------+------------+---------------------------------------------------------------------------------------------------------------------+
-    |       PING        |    No      | PING                                                                                                                |
+    |       PING        |    YES*    | PING                                                                                                                |
     +-------------------+------------+---------------------------------------------------------------------------------------------------------------------+
-    |       QUIT        |    No      | QUIT                                                                                                                |
+    |       QUIT        |    YES     | QUIT                                                                                                                |
     +-------------------+------------+---------------------------------------------------------------------------------------------------------------------+
     |      SELECT       |    No      | SELECT index                                                                                                        |
     +-------------------+------------+---------------------------------------------------------------------------------------------------------------------+
+
+* inline PING is also supported.
 
 ### Server
 
@@ -329,11 +353,13 @@
     +-------------------+------------+---------------------------------------------------------------------------------------------------------------------+
     |    CLIENT LIST    |    No      | CLIENT LIST                                                                                                         |
     +-------------------+------------+---------------------------------------------------------------------------------------------------------------------+
-    |    CONFIG GET     |    No      | CONFIG GET parameter                                                                                                |
+    |    CONFIG GET     |    YES     | CONFIG GET parameter                                                                                                |
     +-------------------+------------+---------------------------------------------------------------------------------------------------------------------+
     |    CONFIG SET     |    No      | CONFIG SET parameter value                                                                                          |
     +-------------------+------------+---------------------------------------------------------------------------------------------------------------------+
-    |  CONFIG RESETSTAT |    No      | CONFIG RESETSTAT                                                                                                    |
+    |  CONFIG RESETSTAT |    No     | CONFIG RESETSTAT                                                                                                    |
+    +-------------------+-------------+--------------------------------------------------------------------------------------------------------------------+
+    |  CONFIG REWRITE   |    No      | CONFIG REWRITE                                                                                                      |
     +-------------------+-------------+--------------------------------------------------------------------------------------------------------------------+
     |     DBSIZE        |    No      | DBSIZE                                                                                                              |
     +-------------------+------------+---------------------------------------------------------------------------------------------------------------------+
